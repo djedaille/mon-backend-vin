@@ -117,6 +117,9 @@ Retourne uniquement un JSON valide, sans autre texte :
         print("❌ GPT Error:", e)
         raise HTTPException(status_code=500, detail="Erreur GPT")
 
+@app.get("/")
+def root():
+    return {"ok": True, "service": "mon-backend-vin"}
 
 @app.post("/upload-etiquette", response_model=FicheVinResponse)
 async def upload_etiquette(file: UploadFile = File(...)):
