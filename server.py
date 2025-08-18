@@ -1,167 +1,119 @@
-# server.py
-
-import os
-import numpy as np
-import re
-import json
-import io
-import traceback
+import os, base64, json
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from pydantic import BaseModel
-from PIL import Image
-import pytesseract
-import easyocr
+from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
-from dotenv import load_dotenv
 
-load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-# Initialise EasyOCR pour le français, anglais, italien et espagnol
-reader = easyocr.Reader(['fr', 'en', 'it', 'es'], gpu=False)
+# ──────────────────────────────────────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────────────────────────────────────
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # à définir dans Render
+OCR_MODEL_DEFAULT = os.getenv("OCR_MODEL", "gpt-4o-mini")  # "gpt-4o" possible
+OCR_DETAIL_DEFAULT = os.getenv("OCR_DETAIL", "low")        # "low" ou "high"
 
-app = FastAPI()
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY manquante (Render → Environment).")
 
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-class FicheVinResponse(BaseModel):
-    ocrTexte: str
-    nom: str = ""
-    domaine: str = ""
-    appellation: str = ""
-    millesime: str = ""
-    region: str = ""
-    pays: str = ""
-    couleur: str = ""
-    cepage: str = ""
-    degreAlcool: str = ""
-    prixEstime: float = 0.0
-    imageEtiquetteUrl: str = ""
-    tempsGarde: str = ""
+app = FastAPI(title="OCR Vin via OpenAI")
 
+# Autorise les appels depuis ton appli mobile / Unity
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # en prod tu peux restreindre
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def ameliorer_image(image: Image.Image) -> Image.Image:
-    """
-    Améliore le contraste et la netteté pour l'OCR.
-    """
-    import cv2
-
-    # Conversion PIL → OpenCV
-    img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-    # Upscale pour meilleure reconnaissance
-    img_cv = cv2.resize(img_cv, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
-    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
-    denoised = cv2.fastNlMeansDenoising(gray, h=30)
-    # Binarisation adaptative
-    thresh = cv2.adaptiveThreshold(
-        denoised, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 31, 10
+# ──────────────────────────────────────────────────────────────────────────────
+# Utilitaires
+# ──────────────────────────────────────────────────────────────────────────────
+def build_prompt():
+    # Demande un JSON strict et stable (faible variance)
+    return (
+        "Tu es un OCR spécialisé vin. Extrait les champs depuis l’étiquette fournie "
+        "et retourne STRICTEMENT un JSON (rien d'autre) avec ces clés en snake_case :\n"
+        "{\n"
+        '  "nom": string,                // nom cuvée ou vin principal (si incertain, "" )\n'
+        '  "domaine": string,            // producteur/domaine (si incertain, "" )\n'
+        '  "appellation": string,        // AOC/IGP/DO, etc.\n'
+        '  "region": string,             // ex: Bordeaux, Rioja\n'
+        '  "pays": string,               // ex: France, Espagne\n'
+        '  "millesime": string,          // ex: "2018" (laisser "" si absent)\n'
+        '  "couleur": string,            // rouge/blanc/rose/petillant ("" si absent)\n'
+        '  "cepages": string,            // ex: "Cabernet Sauvignon;Merlot" (concaténer si multiples)\n'
+        '  "degre": string,              // ex: "13%"\n'
+        '  "volume": string              // ex: "75cl" ou "750ml"\n'
+        "}\n"
+        "Ne fais aucune remarque, uniquement le JSON. Si une info est absente, mets une chaîne vide."
     )
-    return Image.fromarray(thresh)
 
+def ocr_with_openai(image_bytes: bytes, model: str, detail: str) -> dict:
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    messages = [
+        {"role": "system", "content": "Tu sors uniquement du JSON valide."},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": build_prompt()},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{b64}",
+                        "detail": detail  # "low" recommandé, "high" pour cas difficiles
+                    },
+                },
+            ],
+        },
+    ]
 
-def nettoyer_texte_ocr(texte: str) -> str:
-    """
-    Nettoie les caractères parasites de l'OCR.
-    """
-    texte = re.sub(r'[^\wÀ-ÿ%.€\s-]', '', texte)
-    return re.sub(r'\s+', ' ', texte).strip()
+    # Chat Completions (stable et simple pour Unity)
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0,
+        max_tokens=400,
+    )
 
-
-def demander_infos_gpt(texte_ocr: str) -> dict:
-    """
-    Envoie un prompt à l'API OpenAI pour extraire et enrichir les champs vin
-    (cépage, degré, prix, temps de garde).
-    """
-    prompt = f"""
-Tu es un assistant expert en vins.  
-Reçois ce texte OCR :
-{texte_ocr}
-
-1) Extrait sans recherches :
-   - nom, domaine, appellation, millesime, region, pays, couleur  
-2) Fais ensuite une vraie recherche web pour trouver :
-   - cepage
-   - degreAlcool
-   - prixEstime
-   - tempsGarde
-
-Retourne uniquement un JSON valide, sans autre texte :
-{{
-  "nom": "",
-  "domaine": "",
-  "appellation": "",
-  "millesime": "",
-  "region": "",
-  "pays": "",
-  "couleur": "",
-  "cepage": "",
-  "degreAlcool": "",
-  "prixEstime": 0.0,
-  "imageEtiquetteUrl": "",
-  "tempsGarde": ""
-}}
-"""
+    txt = resp.choices[0].message.content
     try:
-        resp = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        content = resp.choices[0].message.content.strip()
-        # On enlève d'éventuelles balises ```json
-        content = re.sub(r"^```(?:json)?\s*", "", content)
-        content = re.sub(r"\s*```$", "", content)
-        return json.loads(content)
+        return json.loads(txt)
     except Exception as e:
-        print("❌ GPT Error:", e)
-        raise HTTPException(status_code=500, detail="Erreur GPT")
+        # Si jamais le modèle a ajouté du texte, tente un rattrapage simple :
+        try:
+            start = txt.find("{")
+            end = txt.rfind("}")
+            if start != -1 and end != -1:
+                return json.loads(txt[start:end+1])
+        except:
+            pass
+        raise HTTPException(status_code=502, detail=f"Réponse non-JSON d’OpenAI: {txt}")
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Endpoints
+# ──────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"ok": True, "service": "mon-backend-vin"}
+    return {"ok": True, "service": "ocr-vin-openai"}
 
-@app.post("/upload-etiquette", response_model=FicheVinResponse)
-async def upload_etiquette(file: UploadFile = File(...)):
+@app.post("/upload-etiquette")
+async def upload_etiquette(
+    image: UploadFile = File(...),
+    model: str = OCR_MODEL_DEFAULT,
+    detail: str = OCR_DETAIL_DEFAULT
+):
+    if image.content_type is None or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Fichier non-image.")
+    data = await image.read()
     try:
-        # Lecture de l'image
-        data = await file.read()
-        image = Image.open(io.BytesIO(data))
-
-        # Pré‑traitement
-        image = ameliorer_image(image)
-
-        # OCR Tesseract
-        ocr_tess = pytesseract.image_to_string(
-            image, lang="fra+eng+ita+spa", config="--oem 1 --psm 6"
-        )
-
-        # OCR EasyOCR
-        buf = io.BytesIO()
-        image.save(buf, format="PNG")
-        buf.seek(0)
-        easy_res = reader.readtext(np.array(Image.open(buf)), detail=0)
-        ocr_easy = "\n".join(easy_res)
-
-        # Fusionner et nettoyer
-        texte_combine = f"Tesseract:\n{ocr_tess}\n\nEasyOCR:\n{ocr_easy}"
-        texte_nettoye = nettoyer_texte_ocr(texte_combine)
-
-        # Interroger GPT
-        infos = demander_infos_gpt(texte_nettoye)
-        infos["ocrTexte"] = ocr_tess
-
-        # S'assurer que prixEstime est un float
-        prix = infos.get("prixEstime", 0)
-        infos["prixEstime"] = float(prix) if str(prix).replace('.', '', 1).isdigit() else 0.0
-
-        # Forcer tous les champs à str ou valeur par défaut
-        for k in ["nom","domaine","appellation","millesime","region","pays","couleur","cepage","degreAlcool","tempsGarde","imageEtiquetteUrl"]:
-            if not isinstance(infos.get(k,""), str):
-                infos[k] = ""
-
-        return FicheVinResponse(**infos)
-
+        result = ocr_with_openai(data, model=model, detail=detail)
+        # Ajoute un fail-safe pour toutes les clés attendues
+        keys = ["nom","domaine","appellation","region","pays","millesime","couleur","cepages","degre","volume"]
+        for k in keys:
+            result.setdefault(k, "")
+        return result
+    except HTTPException:
+        raise
     except Exception as e:
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
