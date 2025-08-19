@@ -1,119 +1,132 @@
-import os, base64, json
+# server.py
+import os, io, json, base64, traceback
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from PIL import Image
 from openai import OpenAI
+from dotenv import load_dotenv
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Config
-# ──────────────────────────────────────────────────────────────────────────────
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # à définir dans Render
-OCR_MODEL_DEFAULT = os.getenv("OCR_MODEL", "gpt-4o-mini")  # "gpt-4o" possible
-OCR_DETAIL_DEFAULT = os.getenv("OCR_DETAIL", "low")        # "low" ou "high"
-
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY manquante (Render → Environment).")
+    raise RuntimeError("OPENAI_API_KEY manquante (Render > Settings > Environment)")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
+app = FastAPI()
 
-app = FastAPI(title="OCR Vin via OpenAI")
+class FicheVinResponse(BaseModel):
+    ocrTexte: str
+    nom: str = ""
+    domaine: str = ""
+    appellation: str = ""
+    millesime: str = ""
+    region: str = ""
+    pays: str = ""
+    couleur: str = ""
+    cepage: str = ""
+    degreAlcool: str = ""
+    prixEstime: float = 0.0
+    imageEtiquetteUrl: str = ""
+    tempsGarde: str = ""
 
-# Autorise les appels depuis ton appli mobile / Unity
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # en prod tu peux restreindre
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+@app.get("/health")
+def health():
+    return {"ok": True}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Utilitaires
-# ──────────────────────────────────────────────────────────────────────────────
-def build_prompt():
-    # Demande un JSON strict et stable (faible variance)
-    return (
-        "Tu es un OCR spécialisé vin. Extrait les champs depuis l’étiquette fournie "
-        "et retourne STRICTEMENT un JSON (rien d'autre) avec ces clés en snake_case :\n"
-        "{\n"
-        '  "nom": string,                // nom cuvée ou vin principal (si incertain, "" )\n'
-        '  "domaine": string,            // producteur/domaine (si incertain, "" )\n'
-        '  "appellation": string,        // AOC/IGP/DO, etc.\n'
-        '  "region": string,             // ex: Bordeaux, Rioja\n'
-        '  "pays": string,               // ex: France, Espagne\n'
-        '  "millesime": string,          // ex: "2018" (laisser "" si absent)\n'
-        '  "couleur": string,            // rouge/blanc/rose/petillant ("" si absent)\n'
-        '  "cepages": string,            // ex: "Cabernet Sauvignon;Merlot" (concaténer si multiples)\n'
-        '  "degre": string,              // ex: "13%"\n'
-        '  "volume": string              // ex: "75cl" ou "750ml"\n'
-        "}\n"
-        "Ne fais aucune remarque, uniquement le JSON. Si une info est absente, mets une chaîne vide."
-    )
+def _safe_float(x, default=0.0):
+    try:
+        return float(str(x).replace(",", "."))
+    except Exception:
+        return default
 
-def ocr_with_openai(image_bytes: bytes, model: str, detail: str) -> dict:
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-    messages = [
-        {"role": "system", "content": "Tu sors uniquement du JSON valide."},
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": build_prompt()},
+@app.post("/upload-etiquette", response_model=FicheVinResponse)
+async def upload_etiquette(file: UploadFile = File(...)):
+    try:
+        raw = await file.read()
+        if not raw or len(raw) == 0:
+            raise HTTPException(status_code=400, detail="Image vide")
+
+        # Convertit en JPEG raisonnable (poids + OCR)
+        try:
+            img = Image.open(io.BytesIO(raw)).convert("RGB")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Fichier non image")
+
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        jpg_bytes = buf.getvalue()
+        b64 = base64.b64encode(jpg_bytes).decode("utf-8")
+
+        # Demande à OpenAI : OCR + extraction propre — pas de web-browsing, si inconnu: ""
+        system = (
+            "Tu lis une étiquette de vin. "
+            "Réponds UNIQUEMENT un JSON valide. "
+            "Si une info est inconnue, renvoie une chaîne vide. "
+            "N'invente pas."
+        )
+        user_text = (
+            "Extrait ces champs et renvoie UNIQUEMENT ce JSON :\n"
+            "{\n"
+            '  "ocrTexte": "",\n'
+            '  "nom": "",\n'
+            '  "domaine": "",\n'
+            '  "appellation": "",\n'
+            '  "millesime": "",\n'
+            '  "region": "",\n'
+            '  "pays": "",\n'
+            '  "couleur": "",\n'
+            '  "cepage": "",\n'
+            '  "degreAlcool": "",\n'
+            '  "prixEstime": 0.0,\n'
+            '  "imageEtiquetteUrl": "",\n'
+            '  "tempsGarde": ""\n'
+            "}\n"
+            "Note : millesime et degreAlcool peuvent être des chaînes (ex: '2018', '13%'). "
+            "prixEstime est un nombre si possible."
+        )
+
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system},
                 {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/png;base64,{b64}",
-                        "detail": detail  # "low" recommandé, "high" pour cas difficiles
-                    },
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_text},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                    ],
                 },
             ],
-        },
-    ]
+        )
+        content = resp.choices[0].message.content.strip()
 
-    # Chat Completions (stable et simple pour Unity)
-    resp = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=0,
-        max_tokens=400,
-    )
+        # Nettoyage éventuel de ```json ... ```
+        if content.startswith("```"):
+            content = content.strip("`")
+            content = content.replace("json\n", "").replace("json", "")
+        data = json.loads(content)
 
-    txt = resp.choices[0].message.content
-    try:
-        return json.loads(txt)
-    except Exception as e:
-        # Si jamais le modèle a ajouté du texte, tente un rattrapage simple :
-        try:
-            start = txt.find("{")
-            end = txt.rfind("}")
-            if start != -1 and end != -1:
-                return json.loads(txt[start:end+1])
-        except:
-            pass
-        raise HTTPException(status_code=502, detail=f"Réponse non-JSON d’OpenAI: {txt}")
+        # Normalisation types
+        out = {
+            "ocrTexte": str(data.get("ocrTexte", ""))[:5000],
+            "nom": str(data.get("nom", "")),
+            "domaine": str(data.get("domaine", "")),
+            "appellation": str(data.get("appellation", "")),
+            "millesime": str(data.get("millesime", "")),
+            "region": str(data.get("region", "")),
+            "pays": str(data.get("pays", "")),
+            "couleur": str(data.get("couleur", "")),
+            "cepage": str(data.get("cepage", "")),
+            "degreAlcool": str(data.get("degreAlcool", "")),
+            "prixEstime": _safe_float(data.get("prixEstime", 0.0), 0.0),
+            "imageEtiquetteUrl": str(data.get("imageEtiquetteUrl", "")),
+            "tempsGarde": str(data.get("tempsGarde", "")),
+        }
+        return FicheVinResponse(**out)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Endpoints
-# ──────────────────────────────────────────────────────────────────────────────
-@app.get("/")
-def root():
-    return {"ok": True, "service": "ocr-vin-openai"}
-
-@app.post("/upload-etiquette")
-async def upload_etiquette(
-    image: UploadFile = File(...),
-    model: str = OCR_MODEL_DEFAULT,
-    detail: str = OCR_DETAIL_DEFAULT
-):
-    if image.content_type is None or not image.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Fichier non-image.")
-    data = await image.read()
-    try:
-        result = ocr_with_openai(data, model=model, detail=detail)
-        # Ajoute un fail-safe pour toutes les clés attendues
-        keys = ["nom","domaine","appellation","region","pays","millesime","couleur","cepages","degre","volume"]
-        for k in keys:
-            result.setdefault(k, "")
-        return result
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        traceback.print_exc()
+        # Renvoie une erreur JSON explicite (évite un crash silencieux)
+        raise HTTPException(status_code=500, detail=f"Server error: {e}")
