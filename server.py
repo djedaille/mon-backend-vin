@@ -46,26 +46,35 @@ async def upload_etiquette(file: UploadFile = File(...)):
         if not raw or len(raw) == 0:
             raise HTTPException(status_code=400, detail="Image vide")
 
-        # Convertit en JPEG raisonnable (poids + OCR)
-        try:
-            img = Image.open(io.BytesIO(raw)).convert("RGB")
-        except Exception:
-            raise HTTPException(status_code=400, detail="Fichier non image")
+        from PIL import Image
+        import io, base64, json, traceback
 
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=85)
-        jpg_bytes = buf.getvalue()
-        b64 = base64.b64encode(jpg_bytes).decode("utf-8")
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-        # Demande à OpenAI : OCR + extraction propre — pas de web-browsing, si inconnu: ""
         system = (
-            "Tu lis une étiquette de vin. "
-            "Réponds UNIQUEMENT un JSON valide. "
-            "Si une info est inconnue, renvoie une chaîne vide. "
-            "N'invente pas."
+            "Tu lis une étiquette de vin uniquement à partir de l'image."
+            " Retourne STRICTEMENT un JSON valide et rien d'autre."
+            " Règles simples :"
+            " - Si tu vois 'Domaine X', mets domaine='Domaine X'."
+            " - Si 'Cuvée Y' apparaît, mets nom='Cuvée Y'."
+            " - millesime = 4 chiffres les plus probables (ex: 2018)."
+            " - degreAlcool = valeur avec '%' si visible (ex: '13%')."
+            " - couleur = rouge / blanc / rosé si déductible (sinon '')."
+            " - pays/region/appellation uniquement si visibles ou clairement déductibles."
+            " - prixEstime et tempsGarde laissent 0.0 et '' s’ils ne sont pas sur l’étiquette."
+            " - N’invente pas : si inconnu => chaîne vide."
+            "Pour remplir les champs vide fait une recherche en allant sur le site du domaine ou sur vivino ou autre"
+            "Par exemple le tempsGarde tu peux le trouver en cherchant : temps de garde pour vin domaine X, cuvé Y"
+            "Le prixEstime tu peux mle trouver sur idealwine"
+            "Extrait sans recherches : nom, domaine, appellation, millesime, region, pays, couleur" 
+            "Fais ensuite une vraie recherche web pour trouver : cepage, degreAlcool, prixEstime, tempsGarde"
         )
+
         user_text = (
-            "Extrait ces champs et renvoie UNIQUEMENT ce JSON :\n"
+            "Extrait et renvoie UNIQUEMENT ce JSON :\n"
             "{\n"
             '  "ocrTexte": "",\n'
             '  "nom": "",\n'
@@ -81,12 +90,10 @@ async def upload_etiquette(file: UploadFile = File(...)):
             '  "imageEtiquetteUrl": "",\n'
             '  "tempsGarde": ""\n'
             "}\n"
-            "Note : millesime et degreAlcool peuvent être des chaînes (ex: '2018', '13%'). "
-            "prixEstime est un nombre si possible."
         )
 
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",  # <- au lieu de gpt-4o-mini
             messages=[
                 {"role": "system", "content": system},
                 {
@@ -97,16 +104,20 @@ async def upload_etiquette(file: UploadFile = File(...)):
                     ],
                 },
             ],
+            temperature=0  # plus déterministe
         )
-        content = resp.choices[0].message.content.strip()
 
-        # Nettoyage éventuel de ```json ... ```
+        content = resp.choices[0].message.content.strip()
         if content.startswith("```"):
-            content = content.strip("`")
-            content = content.replace("json\n", "").replace("json", "")
+            content = content.strip("`").replace("json\n", "").replace("json", "")
         data = json.loads(content)
 
-        # Normalisation types
+        def _safe_float(x, default=0.0):
+            try:
+                return float(str(x).replace(",", "."))
+            except Exception:
+                return default
+
         out = {
             "ocrTexte": str(data.get("ocrTexte", ""))[:5000],
             "nom": str(data.get("nom", "")),
@@ -128,5 +139,4 @@ async def upload_etiquette(file: UploadFile = File(...)):
         raise
     except Exception as e:
         traceback.print_exc()
-        # Renvoie une erreur JSON explicite (évite un crash silencieux)
         raise HTTPException(status_code=500, detail=f"Server error: {e}")
