@@ -530,6 +530,13 @@ async def upload_etiquette(file: UploadFile = File(...)):
             "imageEtiquetteUrl": str(data.get("imageEtiquetteUrl", "")),
             "tempsGarde": 0,
         }
+        
+        out = normalize_fields_after_ocr(out)
+
+        cuvee_hint, _flags = extract_cuvee_tokens(out.get("ocrTexte",""))
+
+        updates = web_enrich(out["nom"], out["domaine"], out["appellation"],
+                             out["millesime"], cuvee_hint=cuvee_hint)
 
         # Inférence minimale depuis le texte OCR (sécurisée)
         inf = infer_from_ocr(out["ocrTexte"])
@@ -547,16 +554,6 @@ async def upload_etiquette(file: UploadFile = File(...)):
             if mapped:
                 out["region"] = mapped
 
-        # Normalisation après OCR
-out = normalize_fields_after_ocr(out)
-
-# indice cuvée pour la recherche (si détectée)
-cuvee_hint, _flags = extract_cuvee_tokens(out.get("ocrTexte",""))
-
-# Enrichissement Web avec variantes robustes
-updates = web_enrich(out["nom"], out["domaine"], out["appellation"], out["millesime"], cuvee_hint=cuvee_hint)
-
-        
         # Enrichissement Web (prix, ABV, garde, cépages, couleur, région/appellation au besoin)
         updates = web_enrich(out["nom"], out["domaine"], out["appellation"], out["millesime"])
 
