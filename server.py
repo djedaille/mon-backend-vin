@@ -21,10 +21,10 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI()
 
-HTTP_TIMEOUT = 7           # secondes par requête HTTP
-MAX_RESULTS  = 6           # nb max de résultats de recherche parcourus
+HTTP_TIMEOUT = 8           # secondes par requête HTTP
+MAX_RESULTS  = 8           # nb max de résultats de recherche parcourus
 USER_AGENT   = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) CaveAVin/1.0 Safari/537.36"
-FAST_MODE    = True        # True = s'arrête au 1er résultat pertinent
+FAST_MODE    = false        # True = s'arrête au 1er résultat pertinent
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Modèle réponse
@@ -117,6 +117,75 @@ def canonicalise_region(region: str) -> str:
         if r.lower() in region.lower():
             return r
     return region
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Extraction cuvée / normalisation post-OCR
+# ──────────────────────────────────────────────────────────────────────────────
+CLEV_CUVEE_TOKENS = [
+    "les chauchoux", "monopole", "tastevinage", "clos", "vieilles vignes",
+    "cuvée", "premier cru", "1er cru"
+]
+
+def extract_cuvee_tokens(ocr: str) -> Tuple[str, Dict[str, bool]]:
+    """Repère la cuvée (ex: 'Les Chauchoux') et des indicateurs ('monopole', 'tastevinage')."""
+    t = (ocr or "").lower()
+    flags = {"monopole": False, "tastevinage": False}
+    cuvee = ""
+
+    # repère une ligne typique "LES CHA…"
+    m = re.search(r"\b(les\s+[A-ZÉÈÊËÀÂÎÏÔÖÙÛÜÇa-z' -]{3,40})\b", ocr, flags=re.IGNORECASE)
+    if m:
+        cand = m.group(1).strip()
+        # évite "les" génériques
+        if any(tok in cand.lower() for tok in ["chauchoux","clos"]):
+            cuvee = cand
+
+    if "monopole" in t: flags["monopole"] = True
+    if "tastevinage" in t: flags["tastevinage"] = True
+
+    return cuvee, flags
+
+def normalize_fields_after_ocr(out: Dict[str, str]) -> Dict[str, str]:
+    """
+    Corrige les inversions nom/appellation/cuvée.
+    Ex attendu pour l'étiquette fournie :
+      appellation=Rully, cuvée=Les Chauchoux, nom='Rully Les Chauchoux (Monopole)'
+    """
+    ocr = out.get("ocrTexte","")
+    # 1) Appellation depuis le texte brut
+    ap, reg = detect_appellation_region(ocr)
+    if ap:
+        out["appellation"] = out["appellation"] or ap
+        out["region"] = out["region"] or APPELLATION_TO_REGION.get(ap, "")
+
+    # 2) Cuvée / drapeaux
+    cuvee, flags = extract_cuvee_tokens(ocr)
+    # si l'OCR a mis "LES CHAUCHOUX" en "appellation", rebasculer en cuvée
+    if out.get("appellation","").strip().lower().startswith("les "):
+        cuvee = out["appellation"]
+        out["appellation"] = ap or out.get("nom","")  # récupère l'appellation depuis nom si besoin
+    # si nom == appellation (ex. 'RULLY'), on vide nom : on le reconstruira
+    if out.get("nom","").strip().lower() == (out.get("appellation","").strip().lower()):
+        out["nom"] = ""
+
+    # 3) Reconstruire un nom propre : Appellation + cuvée (+ Monopole/Tastevinage)
+    if out.get("appellation"):
+        pieces = [out["appellation"]]
+        if cuvee: pieces.append(cuvee)
+        if flags.get("monopole"): pieces.append("Monopole")
+        # we keep Tastevinage as it's often on label (can help web search)
+        if flags.get("tastevinage"): pieces.append("Tastevinage")
+        out["nom"] = " ".join(pieces).strip() or out["nom"]
+
+    # 4) Canonicalise la région si présente
+    if out.get("region"):
+        out["region"] = canonicalise_region(out["region"])
+
+    return out
+
+
+
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Utilitaires parsing Web
@@ -228,124 +297,114 @@ def parse_couleur(text: str) -> str:
     return ""
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Enrichissement Web (aligné sur ma méthode manuelle)
+# Enrichissement Web – variantes de requêtes plus robustes
 # ──────────────────────────────────────────────────────────────────────────────
-def web_enrich(nom: str, domaine: str, appellation: str, millesime: int) -> Dict[str, float|int|str]:
+def web_enrich(nom: str, domaine: str, appellation: str, millesime: int, cuvee_hint: str = "") -> Dict[str, float|int|str]:
     """
-    Recherche multi-sources : iDealwine (prix), producteur / Hachette / cavistes (ABV, garde, cépages),
-    Vivino (ABV / cépage si affiché). Complète appellation→région/cépages/couleur si manquant.
+    Ajoute des variantes de requêtes (swap nom/appellation, ajout cuvée, 'Monopole', 'Tastevinage').
     """
-    base_query = " ".join(x for x in [nom, domaine, appellation, str(millesime) if millesime else ""] if x).strip()
-    if not base_query:
-        return {}
+    base = " ".join(x for x in [nom, domaine, appellation, str(millesime) if millesime else ""] if x).strip()
+    variants = set()
+
+    def add(*parts):
+        q = " ".join(p for p in parts if p).strip()
+        if q: variants.add(q)
+
+    add(base)
+    add(domaine, appellation, cuvee_hint, str(millesime))
+    add(appellation, cuvee_hint, "Monopole", domaine, str(millesime))
+    add(domaine, nom, str(millesime))
+    add(appellation, "Tastevinage", str(millesime), domaine)
+    add(appellation, domaine)
+    # version sans domaine
+    add(appellation, cuvee_hint, str(millesime))
+    add(nom, str(millesime))
 
     updates: Dict[str, float|int|str] = {}
 
-    # 1) Prix : iDealwine prioritaire
-    for url in ddg_search(base_query + " prix", site="idealwine.com", max_results=MAX_RESULTS):
-        text = fetch_text(url)
-        if not text:
-            continue
-        prix = parse_price_eur_on_idealwine(text)
-        if prix > 0:
-            updates["prixEstime"] = prix
-            if FAST_MODE: break
-
-    # 2) Spécs : producteur, Hachette, cavistes, Vivino…
-    #    On tente d'abord le producteur (si domaine dispo) puis Hachette, Vivino, autres cavistes.
-    search_buckets = [
-        (f"{domaine} {base_query} fiche technique", None) if domaine else None,
-        (base_query + " site officiel domaine", None),
-        (base_query + " fiche technique % vol garde", None),
-        (base_query, "hachette-vins.com"),
-        (base_query, "vivino.com"),
-        (base_query, "idealwine.com"),
-    ]
-    search_buckets = [s for s in search_buckets if s]
-
-    visited = 0
-    for q, site in search_buckets:
-        for url in ddg_search(q, site=site, max_results=MAX_RESULTS):
-            visited += 1
+    # 1) Prix iDealwine
+    for q in list(variants):
+        for url in ddg_search(q + " prix", site="idealwine.com", max_results=MAX_RESULTS):
             text = fetch_text(url)
-            if not text:
-                continue
-
-            # ABV
-            if "degreAlcool" not in updates:
-                abv = parse_abv(text)
-                if abv > 0:
-                    updates["degreAlcool"] = abv
-
-            # Garde
-            if "tempsGarde" not in updates:
-                tg = parse_garde_years(text)
-                if tg > 0:
-                    updates["tempsGarde"] = tg
-
-            # Cépages
-            if "cepage" not in updates or not updates.get("cepage"):
-                c = parse_cepages(text)
-                if c:
-                    updates["cepage"] = c
-
-            # Couleur
-            if "couleur" not in updates or not updates.get("couleur"):
-                col = parse_couleur(text)
-                if col:
-                    updates["couleur"] = col
-
-            # Appellation / région
-            if "appellation" not in updates or not updates.get("appellation"):
-                ap, reg = detect_appellation_region(text)
-                if ap:
-                    updates["appellation"] = ap
-                    if "region" not in updates and reg:
-                        updates["region"] = reg
-
-            if FAST_MODE and ("degreAlcool" in updates) and ("cepage" in updates) and ("tempsGarde" in updates):
+            if not text: continue
+            prix = parse_price_eur_on_idealwine(text)
+            if prix > 0:
+                updates["prixEstime"] = prix
                 break
-        if FAST_MODE and ("degreAlcool" in updates) and ("cepage" in updates) and ("tempsGarde" in updates):
+        if "prixEstime" in updates and FAST_MODE:
+            break
+
+    # 2) Spécs multi-sources
+    visited = 0
+    for q in list(variants):
+        # on cible d'abord producteur/Hachette/Vivino, puis large
+        search_plan = [
+            (q, "hachette-vins.com"),
+            (q, "vivino.com"),
+            (q + " fiche technique % vol garde", None),
+            (q, None),
+        ]
+        for s_q, site in search_plan:
+            for url in ddg_search(s_q, site=site, max_results=MAX_RESULTS):
+                visited += 1
+                text = fetch_text(url)
+                if not text: continue
+
+                if "degreAlcool" not in updates:
+                    abv = parse_abv(text)
+                    if abv > 0: updates["degreAlcool"] = abv
+
+                if "tempsGarde" not in updates:
+                    tg = parse_garde_years(text)
+                    if tg > 0: updates["tempsGarde"] = tg
+
+                if "cepage" not in updates or not updates.get("cepage"):
+                    c = parse_cepages(text)
+                    if c: updates["cepage"] = c
+
+                if "couleur" not in updates or not updates.get("couleur"):
+                    col = parse_couleur(text)
+                    if col: updates["couleur"] = col
+
+                if "appellation" not in updates or not updates.get("appellation"):
+                    ap, reg = detect_appellation_region(text)
+                    if ap:
+                        updates["appellation"] = ap
+                        if "region" not in updates and reg:
+                            updates["region"] = reg
+
+                if FAST_MODE and all(k in updates for k in ["degreAlcool","tempsGarde","cepage"]):
+                    break
+            if FAST_MODE and all(k in updates for k in ["degreAlcool","tempsGarde","cepage"]):
+                break
+        if FAST_MODE and all(k in updates for k in ["degreAlcool","tempsGarde","cepage"]):
             break
         if visited >= MAX_RESULTS:
             break
 
-    # 3) Déductions par défaut depuis l’appellation
+    # Compléments depuis l’appellation
     ap = (updates.get("appellation") or appellation or "").strip()
-    reg = updates.get("region", "")
-    if ap and not reg:
+    if ap and "region" not in updates:
         reg = APPELLATION_TO_REGION.get(ap, "")
-        if reg:
-            updates["region"] = reg
+        if reg: updates["region"] = reg
 
-    # Couleur / cépages par défaut si manquant
-    col_lower = (updates.get("couleur","") or "").lower()
     if ap in APPELLATION_DEFAULTS:
         defaults = APPELLATION_DEFAULTS[ap]
-        if not col_lower:
-            # Si le nom contient "blanc"/"rouge"/"rosé"
-            nall = " ".join([nom or "", domaine or "", ap]).lower()
-            if "blanc" in nall:
-                updates["couleur"] = "Blanc"
-            elif "rouge" in nall:
-                updates["couleur"] = "Rouge"
-        # Si toujours vide, on essaie de deviner par cépage
         if not updates.get("couleur"):
             cp = (updates.get("cepage","") or "").lower()
             if "chardonnay" in cp: updates["couleur"] = "Blanc"
             elif any(x in cp for x in ["pinot noir","syrah","grenache","merlot","cabernet"]):
                 updates["couleur"] = "Rouge"
-        # Cépages par défaut si on a une couleur claire
-        col = (updates.get("couleur") or "").lower()
-        if not updates.get("cepage") and col:
-            if col in defaults:
-                updates["cepage"] = defaults[col]
+        if updates.get("couleur") and not updates.get("cepage"):
+            key = updates["couleur"].lower()
+            if key in defaults:
+                updates["cepage"] = defaults[key]
 
-    # Canonicalisation finale
     if "region" in updates:
         updates["region"] = canonicalise_region(str(updates["region"]))
 
     return updates
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers conversion
@@ -488,6 +547,16 @@ async def upload_etiquette(file: UploadFile = File(...)):
             if mapped:
                 out["region"] = mapped
 
+        # Normalisation après OCR
+out = normalize_fields_after_ocr(out)
+
+# indice cuvée pour la recherche (si détectée)
+cuvee_hint, _flags = extract_cuvee_tokens(out.get("ocrTexte",""))
+
+# Enrichissement Web avec variantes robustes
+updates = web_enrich(out["nom"], out["domaine"], out["appellation"], out["millesime"], cuvee_hint=cuvee_hint)
+
+        
         # Enrichissement Web (prix, ABV, garde, cépages, couleur, région/appellation au besoin)
         updates = web_enrich(out["nom"], out["domaine"], out["appellation"], out["millesime"])
 
