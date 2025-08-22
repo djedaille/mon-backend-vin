@@ -9,102 +9,98 @@ from dotenv import load_dotenv
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY manquante (Render > Settings > Environment)")
+    raise RuntimeError("OPENAI_API_KEY manquante")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI()
 
 class FicheVinResponse(BaseModel):
-    ocrTexte: str
+    ocrTexte: str = ""
     nom: str = ""
     domaine: str = ""
     appellation: str = ""
-    millesime: str = ""
+    millesime: int = 0          # 0 = inconnu
     region: str = ""
     pays: str = ""
     couleur: str = ""
     cepage: str = ""
-    degreAlcool: str = ""
-    prixEstime: float = 0.0
+    degreAlcool: float = 0.0    # % ABV (0.0 = inconnu)
+    prixEstime: float = 0.0     # € (0.0 = inconnu)
     imageEtiquetteUrl: str = ""
-    tempsGarde: str = ""
+    tempsGarde: int = 0         # années (0 = inconnu)
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
-def _safe_float(x, default=0.0):
+def _to_float(x, default=0.0):
     try:
-        return float(str(x).replace(",", "."))
+        return float(str(x).replace(",", ".").replace("%","").strip())
     except Exception:
         return default
+
+def _to_int4(x):
+    try:
+        s = str(x).strip()
+        if len(s) == 4 and s.isdigit():
+            return int(s)
+        return int(s)
+    except Exception:
+        return 0
 
 @app.post("/upload-etiquette", response_model=FicheVinResponse)
 async def upload_etiquette(file: UploadFile = File(...)):
     try:
         raw = await file.read()
-        if not raw or len(raw) == 0:
+        if not raw:
             raise HTTPException(status_code=400, detail="Image vide")
 
-        from PIL import Image
-        import io, base64, json, traceback
-
         img = Image.open(io.BytesIO(raw)).convert("RGB")
+        img.thumbnail((1024, 1024), Image.LANCZOS)  # limite la plus grande dimension à 1024
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
+        img.save(buf, format="JPEG", quality=75)
         b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
+        
         system = (
-            "Tu lis une étiquette de vin uniquement à partir de l'image."
-            " Retourne STRICTEMENT un JSON valide et rien d'autre."
-            " Règles simples :"
-            " - Si tu vois 'Domaine X', mets domaine='Domaine X'."
-            " - Si 'Cuvée Y' apparaît, mets nom='Cuvée Y'."
-            " - millesime = 4 chiffres les plus probables (ex: 2018)."
-            " - degreAlcool = valeur avec '%' si visible (ex: '13%')."
-            " - couleur = rouge / blanc / rosé si déductible (sinon '')."
-            " - pays/region/appellation uniquement si visibles ou clairement déductibles."
-            " - prixEstime et tempsGarde laissent 0.0 et '' s’ils ne sont pas sur l’étiquette."
-            " - N’invente pas : si inconnu => chaîne vide."
-            "Pour remplir les champs vide fait une recherche en allant sur le site du domaine ou sur vivino ou autre"
-            "Par exemple le tempsGarde tu peux le trouver en cherchant : temps de garde pour vin domaine X, cuvé Y"
-            "Le prixEstime tu peux mle trouver sur idealwine"
-            "Extrait sans recherches : nom, domaine, appellation, millesime, region, pays, couleur" 
-            "Fais ensuite une vraie recherche web pour trouver : cepage, degreAlcool, prixEstime, tempsGarde"
+            "Tu lis une étiquette de vin uniquement à partir de l'image.\n"
+            "Retourne STRICTEMENT un JSON valide, sans texte autour.\n"
+            "Champs à remplir si visibles, sinon valeur par défaut (0 pour nombres, '' pour chaînes).\n"
+            "Rappels:\n"
+            "- millesime = 4 chiffres probables.\n"
+            "- degreAlcool = nombre (ex: 13.5) sans signe %.\n"
+            "- prixEstime = nombre si indiqué (sinon 0).\n"
+            "- tempsGarde = nombre d'années si indiqué (sinon 0).\n"
         )
 
         user_text = (
-            "Extrait et renvoie UNIQUEMENT ce JSON :\n"
+            "Renvoie UNIQUEMENT ce JSON:\n"
             "{\n"
             '  "ocrTexte": "",\n'
             '  "nom": "",\n'
             '  "domaine": "",\n'
             '  "appellation": "",\n'
-            '  "millesime": "",\n'
+            '  "millesime": 0,\n'
             '  "region": "",\n'
             '  "pays": "",\n'
             '  "couleur": "",\n'
             '  "cepage": "",\n'
-            '  "degreAlcool": "",\n'
+            '  "degreAlcool": 0.0,\n'
             '  "prixEstime": 0.0,\n'
             '  "imageEtiquetteUrl": "",\n'
-            '  "tempsGarde": ""\n'
+            '  "tempsGarde": 0\n'
             "}\n"
         )
 
         resp = client.chat.completions.create(
-            model="gpt-4o",  # <- au lieu de gpt-4o-mini
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_text},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                    ],
-                },
+                {"role": "user", "content": [
+                    {"type": "text", "text": user_text},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                ]},
             ],
-            temperature=0  # plus déterministe
+            temperature=0
         )
 
         content = resp.choices[0].message.content.strip()
@@ -112,26 +108,20 @@ async def upload_etiquette(file: UploadFile = File(...)):
             content = content.strip("`").replace("json\n", "").replace("json", "")
         data = json.loads(content)
 
-        def _safe_float(x, default=0.0):
-            try:
-                return float(str(x).replace(",", "."))
-            except Exception:
-                return default
-
         out = {
             "ocrTexte": str(data.get("ocrTexte", ""))[:5000],
             "nom": str(data.get("nom", "")),
             "domaine": str(data.get("domaine", "")),
             "appellation": str(data.get("appellation", "")),
-            "millesime": str(data.get("millesime", "")),
+            "millesime": _to_int4(data.get("millesime", 0)),
             "region": str(data.get("region", "")),
             "pays": str(data.get("pays", "")),
             "couleur": str(data.get("couleur", "")),
             "cepage": str(data.get("cepage", "")),
-            "degreAlcool": str(data.get("degreAlcool", "")),
-            "prixEstime": _safe_float(data.get("prixEstime", 0.0), 0.0),
+            "degreAlcool": _to_float(data.get("degreAlcool", 0.0), 0.0),
+            "prixEstime": _to_float(data.get("prixEstime", 0.0), 0.0),
             "imageEtiquetteUrl": str(data.get("imageEtiquetteUrl", "")),
-            "tempsGarde": str(data.get("tempsGarde", "")),
+            "tempsGarde": int(str(data.get("tempsGarde", 0)).strip() or 0),
         }
         return FicheVinResponse(**out)
 
