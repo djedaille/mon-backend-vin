@@ -21,10 +21,10 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI()
 
-HTTP_TIMEOUT = 8           # secondes par requête HTTP
-MAX_RESULTS  = 8           # nb max de résultats de recherche parcourus
+HTTP_TIMEOUT = 10           # secondes par requête HTTP
+MAX_RESULTS  = 12           # nb max de résultats de recherche parcourus
 USER_AGENT   = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) CaveAVin/1.0 Safari/537.36"
-FAST_MODE    = True        # True = s'arrête au 1er résultat pertinent (mets False pour élargir)
+FAST_MODE    = False        # True = s'arrête au 1er résultat pertinent (mets False pour élargir)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Modèle réponse
@@ -118,66 +118,110 @@ def canonicalise_region(region: str) -> str:
             return r
     return region
 
+def dbg(*a):
+    if DEBUG:
+        print("[DBG]", *a, flush=True)
+
+# bruit d'étiquette courant à purger
+NOISE_PATTERNS = [
+    r"\bappellation\s+d[’']?origine\s+(?:prot[eé]g[ée]e|contr[ôo]l[ée]e)\b",
+    r"\bappellation\s+[A-Za-z\- ]+\s+(?:prot[eé]g[ée]e|contr[ôo]l[ée]e)\b",
+    r"\bappellation\b",
+    r"\bAOP\b|\bAOC\b",
+    r"\bgrand\s+vin\s+de\s+bourgogne\b",
+    r"\bvin\s+de\s+bourgogne\b",
+    r"\bmis\s+en\s+bouteille.*$",
+    r"\bproduct\s+of\s+france\b",
+]
+
+def strip_label_noise(s: str) -> str:
+    if not s: return s
+    t = s
+    for pat in NOISE_PATTERNS:
+        t = re.sub(pat, " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s{2,}", " ", t).strip(" -_,.\n\t")
+    return t
+
+def clean_appellation_value(s: str) -> str:
+    """Transforme 'Appellation Rully Protégée' → 'Rully', etc."""
+    if not s: return s
+    low = s.lower()
+    if "rully" in low:
+        return "Rully"
+    # ajoute d’autres cas si besoin
+    return strip_label_noise(s)
+
+def titleish(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Extraction cuvée / normalisation post-OCR
 # ──────────────────────────────────────────────────────────────────────────────
 def extract_cuvee_tokens(ocr: str) -> Tuple[str, Dict[str, bool]]:
-    """Repère la cuvée (ex: 'Les Chauchoux') et des indicateurs ('monopole', 'tastevinage')."""
-    t = (ocr or "").lower()
-    flags = {"monopole": False, "tastevinage": False}
+    """Repère la cuvée (ex: 'Les Chauchoux') et flags ('monopole', 'tastevinage')."""
+    t = (ocr or "")
+    tl = t.lower()
+    flags = {"monopole": "monopole" in tl, "tastevinage": "tastevinage" in tl}
     cuvee = ""
 
-    # repère une ligne typique "LES …"
-    m = re.search(r"\b(les\s+[A-ZÉÈÊËÀÂÎÏÔÖÙÛÜÇa-z' -]{3,40})\b", ocr, flags=re.IGNORECASE)
-    if m:
-        cand = m.group(1).strip()
-        # évite "les" génériques
-        if any(tok in cand.lower() for tok in ["chauchoux","clos","tastesvinage"]):
-            cuvee = cand
-
-    if "monopole" in t: flags["monopole"] = True
-    if "tastevinage" in t: flags["tastevinage"] = True
-
-    return cuvee, flags
+    # candidats "Les XXX", "Le/La XXX", "Clos XXX", "Cuvée XXX"
+    lines = [x.strip() for x in re.split(r"[\n\r]", t) if x.strip()]
+    candidates = []
+    for line in lines:
+        if re.search(r"^\s*(les|le|la|clos|cuv[ée]e)\b", line, flags=re.IGNORECASE):
+            # on évite le bruit générique
+            if not re.search(r"appellation|prot[eé]g[ée]e|d[’']?origine|aoc|aop", line, flags=re.IGNORECASE):
+                candidates.append(line)
+    # priorité aux lignes contenant 'Chauchoux'
+    for c in candidates:
+        if re.search(r"\bchauchoux\b", c, flags=re.IGNORECASE):
+            cuvee = c
+            break
+    if not cuvee and candidates:
+        cuvee = candidates[0]
+    return titleish(cuvee), flags
 
 def normalize_fields_after_ocr(out: Dict[str, str]) -> Dict[str, str]:
     """
-    Corrige les inversions nom/appellation/cuvée et reconstruit un nom propre.
+    Corrige inversions, purge bruit, normalise appellation et reconstruit nom.
     Ex attendu : appellation=Rully, cuvée=Les Chauchoux, nom='Rully Les Chauchoux Monopole'.
     """
-    ocr = out.get("ocrTexte","")
-
-    # 1) Appellation depuis le texte brut
+    ocr = out.get("ocrTexte","") or ""
+    # 1) Appellation depuis OCR
     ap, reg = detect_appellation_region(ocr)
-    if ap:
-        out["appellation"] = out["appellation"] or ap
-        out["region"] = out["region"] or APPELLATION_TO_REGION.get(ap, "")
+    cur_app = out.get("appellation","")
+    # si l'OCR a mis 'Appellation Rully Protégée' → 'Rully'
+    cur_app = clean_appellation_value(cur_app) if cur_app else ap
+    if cur_app:
+        out["appellation"] = " ".join(cur_app.split())  # condense
+        if not out.get("region"):
+            out["region"] = APPELLATION_TO_REGION.get(out["appellation"], out.get("region",""))
 
-    # 2) Cuvée / drapeaux
+    # 2) Cuvée + flags
     cuvee, flags = extract_cuvee_tokens(ocr)
 
-    # si l'OCR a mis "LES …" en "appellation", rebasculer en cuvée
-    if out.get("appellation","").strip().lower().startswith("les "):
-        cuvee = out["appellation"]
-        out["appellation"] = ap or out.get("nom","")
+    # si l'appellation ressemble à 'Les ...', on la bascule en cuvée
+    if out.get("appellation","").lower().startswith("les "):
+        if not cuvee:
+            cuvee = out["appellation"]
+        out["appellation"] = clean_appellation_value(ap or "")
 
-    # si nom == appellation (ex. 'RULLY'), on vide nom : on le reconstruira
-    if out.get("nom","").strip().lower() == (out.get("appellation","").strip().lower()):
-        out["nom"] = ""
-
-    # 3) Reconstruire un nom propre : Appellation + cuvée (+ Monopole/Tastevinage)
+    # 3) Purge le bruit dans nom + recalcule nom propre
+    out["nom"] = strip_label_noise(out.get("nom",""))
     if out.get("appellation"):
         pieces = [out["appellation"]]
-        if cuvee: pieces.append(cuvee)
+        if cuvee and cuvee.lower() != out["appellation"].lower():
+            pieces.append(cuvee)
         if flags.get("monopole"): pieces.append("Monopole")
         if flags.get("tastevinage"): pieces.append("Tastevinage")
         out["nom"] = " ".join(pieces).strip() or out["nom"]
 
-    # 4) Canonicalise la région si présente
+    # 4) Canonicalise région
     if out.get("region"):
         out["region"] = canonicalise_region(out["region"])
 
     return out
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Utilitaires parsing Web
@@ -191,22 +235,34 @@ GARDE_RE = re.compile(r"(?:garde|apog[ée]e?).{0,25}?(\d{1,2})(?:\s*[-à]\s*(\d{
 
 def ddg_search(query: str, site: str=None, max_results: int=MAX_RESULTS) -> List[str]:
     q = f"site:{site} {query}" if site else query
-    url = "https://duckduckgo.com/html/"
-    try:
-        r = SESS.post(url, data={"q": q}, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        links = []
-        for a in soup.select("a.result__a, a.result__url"):
-            href = a.get("href")
-            if not href:
-                continue
-            if href.startswith("/l/?kh=") or href.startswith("/?q="):
-                continue
-            links.append(href)
-            if len(links) >= max_results:
-                break
-        return links
+    endpoints = [
+        ("GET",  "https://html.duckduckgo.com/html/"),
+        ("GET",  "https://duckduckgo.com/html/"),
+        ("POST", "https://duckduckgo.com/html/"),
+    ]
+    links: List[str] = []
+    for method, base in endpoints:
+        try:
+            if method == "GET":
+                r = SESS.get(base, params={"q": q, "kl":"fr-fr"}, timeout=HTTP_TIMEOUT)
+            else:
+                r = SESS.post(base, data={"q": q, "kl":"fr-fr"}, timeout=HTTP_TIMEOUT)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.select("a.result__a, a.result__url, a[href^='http']"):
+                href = a.get("href")
+                if not href or href.startswith("/"):  # on évite les redirections internes
+                    continue
+                links.append(href)
+                if len(links) >= max_results:
+                    dbg("ddg top links", links)
+                    return links
+        except Exception as e:
+            dbg("ddg endpoint failed:", base, repr(e))
+            continue
+    dbg("ddg no links for", q)
+    return links
+
     except Exception:
         return []
 
