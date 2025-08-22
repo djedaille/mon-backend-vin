@@ -111,7 +111,7 @@ def ddg_search(query: str, site: str=None, max_results: int=MAX_RESULTS) -> List
     try:
         r = SESS.post(url, data={"q": q}, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
-        soup = BeautifulSoup(r.text, "lxml")
+        soup = BeautifulSoup(r.text, "html.parser")
         links = []
         for a in soup.select("a.result__a, a.result__url"):
             href = a.get("href")
@@ -134,7 +134,7 @@ def fetch_text(url: str) -> str:
         # Evite les binaires
         if "text/html" not in r.headers.get("Content-Type",""):
             return ""
-        soup = BeautifulSoup(r.text, "lxml")
+        soup = BeautifulSoup(r.text, "html.parser")
         # retire scripts/styles/nav
         for tag in soup(["script","style","nav","header","footer","noscript"]):
             tag.decompose()
