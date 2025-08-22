@@ -303,8 +303,9 @@ async def upload_etiquette(file: UploadFile = File(...)):
             "Rappels:\n"
             "- millesime = 4 chiffres probables.\n"
             "- degreAlcool = nombre (ex: 13.5) sans signe %.\n"
-            "- prixEstime = 0 (ne PAS remplir depuis l'image).\n"
-            "- tempsGarde = 0 (ne PAS remplir depuis l'image).\n"
+            "- prixEstime = 0 (ne PAS remplir depuis l'image tu devrait aller sur les cotes de vin idealwine.com ou sur vivino par exemple).\n"
+            "- tempsGarde = 0 (ne PAS remplir depuis l'image fait une recherche internet en tapant temps de garde et tout ce que tu as sur le vin).\n"
+            "- cepage = 0 (fait une recherche internet en tapant cepage et le ocr).\n"
         )
         user_text = (
             "Renvoie UNIQUEMENT ce JSON:\n"
