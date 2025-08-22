@@ -24,7 +24,7 @@ app = FastAPI()
 HTTP_TIMEOUT = 8           # secondes par requête HTTP
 MAX_RESULTS  = 8           # nb max de résultats de recherche parcourus
 USER_AGENT   = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) CaveAVin/1.0 Safari/537.36"
-FAST_MODE    = false        # True = s'arrête au 1er résultat pertinent
+FAST_MODE    = True        # True = s'arrête au 1er résultat pertinent (mets False pour élargir)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Modèle réponse
@@ -121,23 +121,18 @@ def canonicalise_region(region: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 # Extraction cuvée / normalisation post-OCR
 # ──────────────────────────────────────────────────────────────────────────────
-CLEV_CUVEE_TOKENS = [
-    "les chauchoux", "monopole", "tastevinage", "clos", "vieilles vignes",
-    "cuvée", "premier cru", "1er cru"
-]
-
 def extract_cuvee_tokens(ocr: str) -> Tuple[str, Dict[str, bool]]:
     """Repère la cuvée (ex: 'Les Chauchoux') et des indicateurs ('monopole', 'tastevinage')."""
     t = (ocr or "").lower()
     flags = {"monopole": False, "tastevinage": False}
     cuvee = ""
 
-    # repère une ligne typique "LES CHA…"
+    # repère une ligne typique "LES …"
     m = re.search(r"\b(les\s+[A-ZÉÈÊËÀÂÎÏÔÖÙÛÜÇa-z' -]{3,40})\b", ocr, flags=re.IGNORECASE)
     if m:
         cand = m.group(1).strip()
         # évite "les" génériques
-        if any(tok in cand.lower() for tok in ["chauchoux","clos"]):
+        if any(tok in cand.lower() for tok in ["chauchoux","clos","tastesvinage"]):
             cuvee = cand
 
     if "monopole" in t: flags["monopole"] = True
@@ -147,11 +142,11 @@ def extract_cuvee_tokens(ocr: str) -> Tuple[str, Dict[str, bool]]:
 
 def normalize_fields_after_ocr(out: Dict[str, str]) -> Dict[str, str]:
     """
-    Corrige les inversions nom/appellation/cuvée.
-    Ex attendu pour l'étiquette fournie :
-      appellation=Rully, cuvée=Les Chauchoux, nom='Rully Les Chauchoux (Monopole)'
+    Corrige les inversions nom/appellation/cuvée et reconstruit un nom propre.
+    Ex attendu : appellation=Rully, cuvée=Les Chauchoux, nom='Rully Les Chauchoux Monopole'.
     """
     ocr = out.get("ocrTexte","")
+
     # 1) Appellation depuis le texte brut
     ap, reg = detect_appellation_region(ocr)
     if ap:
@@ -160,10 +155,12 @@ def normalize_fields_after_ocr(out: Dict[str, str]) -> Dict[str, str]:
 
     # 2) Cuvée / drapeaux
     cuvee, flags = extract_cuvee_tokens(ocr)
-    # si l'OCR a mis "LES CHAUCHOUX" en "appellation", rebasculer en cuvée
+
+    # si l'OCR a mis "LES …" en "appellation", rebasculer en cuvée
     if out.get("appellation","").strip().lower().startswith("les "):
         cuvee = out["appellation"]
-        out["appellation"] = ap or out.get("nom","")  # récupère l'appellation depuis nom si besoin
+        out["appellation"] = ap or out.get("nom","")
+
     # si nom == appellation (ex. 'RULLY'), on vide nom : on le reconstruira
     if out.get("nom","").strip().lower() == (out.get("appellation","").strip().lower()):
         out["nom"] = ""
@@ -173,7 +170,6 @@ def normalize_fields_after_ocr(out: Dict[str, str]) -> Dict[str, str]:
         pieces = [out["appellation"]]
         if cuvee: pieces.append(cuvee)
         if flags.get("monopole"): pieces.append("Monopole")
-        # we keep Tastevinage as it's often on label (can help web search)
         if flags.get("tastevinage"): pieces.append("Tastevinage")
         out["nom"] = " ".join(pieces).strip() or out["nom"]
 
@@ -182,10 +178,6 @@ def normalize_fields_after_ocr(out: Dict[str, str]) -> Dict[str, str]:
         out["region"] = canonicalise_region(out["region"])
 
     return out
-
-
-
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Utilitaires parsing Web
@@ -282,9 +274,7 @@ def parse_cepages(text: str) -> str:
     for g in GRAPE_TERMS:
         if re.search(rf"\b{re.escape(g)}\b", t):
             hits.append(g)
-    # nettoyage capitalisation simple
-    hits = [h.title() for h in hits]
-    # fusion GSM courante
+    hits = [h.title() for h in hits]  # simple capitalisation
     if set(["Grenache","Syrah","Mourvèdre"]).issubset(set(hits)):
         return "Grenache/Syrah/Mourvèdre"
     return "/".join(dict.fromkeys(hits))  # unique en gardant l'ordre
@@ -316,8 +306,7 @@ def web_enrich(nom: str, domaine: str, appellation: str, millesime: int, cuvee_h
     add(domaine, nom, str(millesime))
     add(appellation, "Tastevinage", str(millesime), domaine)
     add(appellation, domaine)
-    # version sans domaine
-    add(appellation, cuvee_hint, str(millesime))
+    add(appellation, cuvee_hint, str(millesime))  # sans domaine
     add(nom, str(millesime))
 
     updates: Dict[str, float|int|str] = {}
@@ -337,7 +326,6 @@ def web_enrich(nom: str, domaine: str, appellation: str, millesime: int, cuvee_h
     # 2) Spécs multi-sources
     visited = 0
     for q in list(variants):
-        # on cible d'abord producteur/Hachette/Vivino, puis large
         search_plan = [
             (q, "hachette-vins.com"),
             (q, "vivino.com"),
@@ -405,7 +393,6 @@ def web_enrich(nom: str, domaine: str, appellation: str, millesime: int, cuvee_h
 
     return updates
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers conversion
 # ──────────────────────────────────────────────────────────────────────────────
@@ -440,7 +427,7 @@ def infer_from_ocr(ocr: str) -> Dict[str,str]:
     if ap:
         res["appellation"] = ap
         res["region"] = APPELLATION_TO_REGION.get(ap,"")
-    # Millésime (année isolée plausible)
+    # Millésime (année plausible)
     y = re.search(r"\b(19|20)\d{2}\b", ocr)
     if y:
         res["millesime"] = y.group(0)
@@ -511,10 +498,10 @@ async def upload_etiquette(file: UploadFile = File(...)):
 
         content = (resp.choices[0].message.content or "").strip()
         if content.startswith("```"):
-            # strip fences robustement
             content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.DOTALL)
         data = json.loads(content)
 
+        # 1) Valeurs issues de l'OCR
         out = {
             "ocrTexte": str(data.get("ocrTexte", ""))[:5000],
             "nom": str(data.get("nom", "")),
@@ -530,15 +517,8 @@ async def upload_etiquette(file: UploadFile = File(...)):
             "imageEtiquetteUrl": str(data.get("imageEtiquetteUrl", "")),
             "tempsGarde": 0,
         }
-        
-        out = normalize_fields_after_ocr(out)
 
-        cuvee_hint, _flags = extract_cuvee_tokens(out.get("ocrTexte",""))
-
-        updates = web_enrich(out["nom"], out["domaine"], out["appellation"],
-                             out["millesime"], cuvee_hint=cuvee_hint)
-
-        # Inférence minimale depuis le texte OCR (sécurisée)
+        # 2) Inférence minimale depuis le texte OCR (sécurise domaine/appellation/année)
         inf = infer_from_ocr(out["ocrTexte"])
         out["domaine"] = out["domaine"] or inf.get("domaine","")
         out["appellation"] = out["appellation"] or inf.get("appellation","")
@@ -546,7 +526,10 @@ async def upload_etiquette(file: UploadFile = File(...)):
         if out["millesime"] == 0 and inf.get("millesime"):
             out["millesime"] = _to_int4(inf["millesime"])
 
-        # Canonicalisations
+        # 3) Normalisation (reconstruit nom, bascule cuvée si besoin)
+        out = normalize_fields_after_ocr(out)
+
+        # 4) Canonicalisations complémentaires
         if out["region"]:
             out["region"] = canonicalise_region(out["region"])
         if out["appellation"] and not out["region"]:
@@ -554,10 +537,13 @@ async def upload_etiquette(file: UploadFile = File(...)):
             if mapped:
                 out["region"] = mapped
 
-        # Enrichissement Web (prix, ABV, garde, cépages, couleur, région/appellation au besoin)
-        updates = web_enrich(out["nom"], out["domaine"], out["appellation"], out["millesime"])
+        # 5) Indice cuvée pour la recherche
+        cuvee_hint, _flags = extract_cuvee_tokens(out.get("ocrTexte",""))
 
-        # Application des updates trouvées
+        # 6) Enrichissement Web (prix, ABV, garde, cépages, couleur, région/appellation au besoin)
+        updates = web_enrich(out["nom"], out["domaine"], out["appellation"], out["millesime"], cuvee_hint=cuvee_hint)
+
+        # 7) Application des updates trouvées
         if "degreAlcool" in updates: out["degreAlcool"] = float(updates["degreAlcool"])
         if "prixEstime"   in updates: out["prixEstime"]   = float(updates["prixEstime"])
         if "tempsGarde"   in updates: out["tempsGarde"]   = int(updates["tempsGarde"])
@@ -566,15 +552,14 @@ async def upload_etiquette(file: UploadFile = File(...)):
         if "appellation"  in updates and not out["appellation"]: out["appellation"] = str(updates["appellation"])
         if "region"       in updates and not out["region"]: out["region"] = str(updates["region"])
 
-        # Pays par défaut si région FR
+        # 8) Pays par défaut si région FR
         if not out["pays"] and out["region"] in REGIONS_FR:
             out["pays"] = "France"
 
-        # Fallbacks intelligents (si rien trouvé sur le web)
+        # 9) Fallbacks intelligents
         if out["appellation"] in APPELLATION_DEFAULTS:
             defaults = APPELLATION_DEFAULTS[out["appellation"]]
             if not out["couleur"]:
-                # Si le nom contient explicitement
                 nall = " ".join([out["nom"], out["domaine"], out["appellation"]]).lower()
                 if "blanc" in nall: out["couleur"] = "Blanc"
                 elif "rouge" in nall: out["couleur"] = "Rouge"
@@ -588,11 +573,10 @@ async def upload_etiquette(file: UploadFile = File(...)):
             out["cepage"] = out["cepage"] or "Pinot Noir"
             out["couleur"] = out["couleur"] or "Rouge"
 
-        # Dernier filet: prix & garde raisonnables si toujours à 0 (Bourgogne village)
+        # Dernier filet pour Rully si vraiment rien (aligné avec notre exemple)
         if out["prixEstime"] == 0.0 and out["appellation"] == "Rully":
             out["prixEstime"] = 20.0
         if out["tempsGarde"] == 0 and out["appellation"] == "Rully":
-            # comme dans l'exemple : 2025–2029 ≈ 4 ans de garde résiduelle
             out["tempsGarde"] = 4
 
         return FicheVinResponse(**out)
